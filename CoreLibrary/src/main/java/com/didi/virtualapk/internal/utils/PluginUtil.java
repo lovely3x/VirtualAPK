@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package com.didi.virtualapk.utils;
+package com.didi.virtualapk.internal.utils;
 
 import android.app.Activity;
 import android.content.ComponentName;
@@ -23,20 +23,18 @@ import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
-import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
-import android.support.annotation.Keep;
 import android.text.TextUtils;
-import android.view.ContextThemeWrapper;
+import android.util.Log;
 
 import com.didi.virtualapk.PluginManager;
 import com.didi.virtualapk.internal.Constants;
 import com.didi.virtualapk.internal.LoadedPlugin;
+import com.didi.virtualapk.utils.Reflector;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -46,10 +44,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Enumeration;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -57,17 +51,25 @@ import java.util.zip.ZipFile;
  * Created by renyugang on 16/8/15.
  */
 public class PluginUtil {
-
-    public static String getTargetActivity(Intent intent) {
-        return intent.getStringExtra(Constants.KEY_TARGET_ACTIVITY);
-    }
-
+    
+    public static final String TAG = Constants.TAG_PREFIX + "NativeLib";
+    
     public static ComponentName getComponent(Intent intent) {
-        return new ComponentName(intent.getStringExtra(Constants.KEY_TARGET_PACKAGE),
+        if (intent == null) {
+            return null;
+        }
+        if (isIntentFromPlugin(intent)) {
+            return new ComponentName(intent.getStringExtra(Constants.KEY_TARGET_PACKAGE),
                 intent.getStringExtra(Constants.KEY_TARGET_ACTIVITY));
+        }
+        
+        return intent.getComponent();
     }
 
     public static boolean isIntentFromPlugin(Intent intent) {
+        if (intent == null) {
+            return false;
+        }
         return intent.getBooleanExtra(Constants.KEY_IS_PLUGIN, false);
     }
 
@@ -96,7 +98,7 @@ public class PluginUtil {
             return appInfo.theme;
         }
 
-        return PluginUtil.selectDefaultTheme(0, Build.VERSION.SDK_INT);
+        return selectDefaultTheme(0, Build.VERSION.SDK_INT);
     }
 
     public static int selectDefaultTheme(final int curTheme, final int targetSdkVersion) {
@@ -107,7 +109,7 @@ public class PluginUtil {
                 android.R.style.Theme_DeviceDefault_Light_DarkActionBar);
     }
 
-    private static int selectSystemTheme(final int curTheme, final int targetSdkVersion, final int orig, final int holo, final int dark, final int deviceDefault) {
+    public static int selectSystemTheme(final int curTheme, final int targetSdkVersion, final int orig, final int holo, final int dark, final int deviceDefault) {
         if (curTheme != 0) {
             return curTheme;
         }
@@ -139,19 +141,20 @@ public class PluginUtil {
             final LoadedPlugin plugin = PluginManager.getInstance(activity).getLoadedPlugin(packageName);
             final Resources resources = plugin.getResources();
             if (resources != null) {
-                ReflectUtil.setField(base.getClass(), base, "mResources", resources);
+                Reflector.with(base).field("mResources").set(resources);
 
                 // copy theme
                 Resources.Theme theme = resources.newTheme();
                 theme.setTo(activity.getTheme());
-                int themeResource = (int)ReflectUtil.getField(ContextThemeWrapper.class, activity, "mThemeResource");
+                Reflector reflector = Reflector.with(activity);
+                int themeResource = reflector.field("mThemeResource").get();
                 theme.applyStyle(themeResource, true);
-                ReflectUtil.setField(ContextThemeWrapper.class, activity, "mTheme", theme);
+                reflector.field("mTheme").set(theme);
 
-                ReflectUtil.setField(ContextThemeWrapper.class, activity, "mResources", resources);
+                reflector.field("mResources").set(resources);
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            Log.w(Constants.TAG, e);
         }
     }
 
@@ -167,87 +170,113 @@ public class PluginUtil {
         if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
             bundle.putBinder(key, value);
         } else {
-            try {
-                ReflectUtil.invoke(Bundle.class, bundle, "putIBinder", new Class[]{String.class, IBinder.class}, key, value);
-            } catch (Exception e) {
-            }
+            Reflector.QuietReflector.with(bundle).method("putIBinder", String.class, IBinder.class).call(key, value);
         }
     }
 
     public static IBinder getBinder(Bundle bundle, String key) {
+        if (bundle == null) {
+            return null;
+        }
         if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
             return bundle.getBinder(key);
         } else {
-            try {
-                return (IBinder) ReflectUtil.invoke(Bundle.class, bundle, "getIBinder", key);
-            } catch (Exception e) {
-            }
-
-            return null;
+            return (IBinder) Reflector.QuietReflector.with(bundle)
+                .method("getIBinder", String.class).call(key);
         }
     }
-
-    public static void copyNativeLib(File apk, Context context, PackageInfo packageInfo, File nativeLibDir) {
+    
+    public static void copyNativeLib(File apk, Context context, PackageInfo packageInfo, File nativeLibDir) throws Exception {
+        long startTime = System.currentTimeMillis();
+        ZipFile zipfile = new ZipFile(apk.getAbsolutePath());
+    
         try {
-            String cpuArch;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                cpuArch = Build.SUPPORTED_ABIS[0];
-            } else {
-                cpuArch = Build.CPU_ABI;
-            }
-            boolean findSo = false;
-
-            ZipFile zipfile = new ZipFile(apk.getAbsolutePath());
-            ZipEntry entry;
-            Enumeration e = zipfile.entries();
-            while (e.hasMoreElements()) {
-                entry = (ZipEntry) e.nextElement();
-                if (entry.isDirectory())
-                    continue;
-                if(entry.getName().endsWith(".so") && entry.getName().contains("lib/" + cpuArch)){
-                    findSo = true;
-                    break;
-                }
-            }
-            e = zipfile.entries();
-            while (e.hasMoreElements()) {
-                entry = (ZipEntry) e.nextElement();
-                if (entry.isDirectory() || !entry.getName().endsWith(".so"))
-                    continue;
-                if((findSo && entry.getName().contains("lib/" + cpuArch)) || (!findSo && entry.getName().contains("lib/armeabi/"))){
-                    String[] temp = entry.getName().split("/");
-                    String libName = temp[temp.length - 1];
-                    System.out.println("verify so " + libName);
-                    File libFile = new File(nativeLibDir.getAbsolutePath() + File.separator + libName);
-                    String key = packageInfo.packageName + "_" + libName;
-                    if (libFile.exists()) {
-                        int VersionCode = Settings.getSoVersion(context, key);
-                        if (VersionCode == packageInfo.versionCode) {
-                            System.out.println("skip existing so : " + entry.getName());
-                            continue;
-                        }
+                for (String cpuArch : Build.SUPPORTED_ABIS) {
+                    if (findAndCopyNativeLib(zipfile, context, cpuArch, packageInfo, nativeLibDir)) {
+                        return;
                     }
-                    FileOutputStream fos = new FileOutputStream(libFile);
-                    System.out.println("copy so " + entry.getName() + " of " + cpuArch);
-                    copySo(zipfile.getInputStream(entry), fos);
-                    Settings.setSoVersion(context, key, packageInfo.versionCode);
                 }
-
+                
+            } else {
+                if (findAndCopyNativeLib(zipfile, context, Build.CPU_ABI, packageInfo, nativeLibDir)) {
+                    return;
+                }
             }
-
+            
+            findAndCopyNativeLib(zipfile, context, "armeabi", packageInfo, nativeLibDir);
+    
+        } finally {
             zipfile.close();
-        } catch (IOException e) {
-            e.printStackTrace();
+            Log.d(TAG, "Done! +" + (System.currentTimeMillis() - startTime) + "ms");
         }
     }
-
-    private static void copySo(InputStream input, OutputStream output) throws IOException {
+    
+    private static boolean findAndCopyNativeLib(ZipFile zipfile, Context context, String cpuArch, PackageInfo packageInfo, File nativeLibDir) throws Exception {
+        Log.d(TAG, "Try to copy plugin's cup arch: " + cpuArch);
+        boolean findLib = false;
+        boolean findSo = false;
+        byte buffer[] = null;
+        String libPrefix = "lib/" + cpuArch + "/";
+        ZipEntry entry;
+        Enumeration e = zipfile.entries();
+        
+        while (e.hasMoreElements()) {
+            entry = (ZipEntry) e.nextElement();
+            String entryName = entry.getName();
+            
+            if (entryName.charAt(0) < 'l') {
+                continue;
+            }
+            if (entryName.charAt(0) > 'l') {
+                break;
+            }
+            if (!findLib && !entryName.startsWith("lib/")) {
+                continue;
+            }
+            findLib = true;
+            if (!entryName.endsWith(".so") || !entryName.startsWith(libPrefix)) {
+                continue;
+            }
+    
+            if (buffer == null) {
+                findSo = true;
+                Log.d(TAG, "Found plugin's cup arch dir: " + cpuArch);
+                buffer = new byte[8192];
+            }
+            
+            String libName = entryName.substring(entryName.lastIndexOf('/') + 1);
+            Log.d(TAG, "verify so " + libName);
+            File libFile = new File(nativeLibDir, libName);
+            String key = packageInfo.packageName + "_" + libName;
+            if (libFile.exists()) {
+                int VersionCode = Settings.getSoVersion(context, key);
+                if (VersionCode == packageInfo.versionCode) {
+                    Log.d(TAG, "skip existing so : " + entry.getName());
+                    continue;
+                }
+            }
+            FileOutputStream fos = new FileOutputStream(libFile);
+            Log.d(TAG, "copy so " + entry.getName() + " of " + cpuArch);
+            copySo(buffer, zipfile.getInputStream(entry), fos);
+            Settings.setSoVersion(context, key, packageInfo.versionCode);
+        }
+        
+        if (!findLib) {
+            Log.d(TAG, "Fast skip all!");
+            return true;
+        }
+        
+        return findSo;
+    }
+    
+    private static void copySo(byte[] buffer, InputStream input, OutputStream output) throws IOException {
         BufferedInputStream bufferedInput = new BufferedInputStream(input);
         BufferedOutputStream bufferedOutput = new BufferedOutputStream(output);
         int count;
-        byte data[] = new byte[8192];
-        while ((count = bufferedInput.read(data, 0, 8192)) != -1) {
-            bufferedOutput.write(data, 0, count);
+        
+        while ((count = bufferedInput.read(buffer)) > 0) {
+            bufferedOutput.write(buffer, 0, count);
         }
         bufferedOutput.flush();
         bufferedOutput.close();

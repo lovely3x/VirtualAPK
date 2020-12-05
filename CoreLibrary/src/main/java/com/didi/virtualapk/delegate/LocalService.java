@@ -26,13 +26,15 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Binder;
+import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
 
 import com.didi.virtualapk.PluginManager;
+import com.didi.virtualapk.internal.Constants;
 import com.didi.virtualapk.internal.LoadedPlugin;
-import com.didi.virtualapk.utils.PluginUtil;
-import com.didi.virtualapk.utils.ReflectUtil;
+import com.didi.virtualapk.internal.utils.PluginUtil;
+import com.didi.virtualapk.utils.Reflector;
 
 import java.lang.reflect.Method;
 
@@ -40,7 +42,7 @@ import java.lang.reflect.Method;
  * @author johnsonlee
  */
 public class LocalService extends Service {
-    private static final String TAG = "LocalService";
+    private static final String TAG = Constants.TAG_PREFIX + "LocalService";
 
     /**
      * The target service, usually it's a plugin service intent
@@ -82,10 +84,16 @@ public class LocalService extends Service {
 
         ComponentName component = target.getComponent();
         LoadedPlugin plugin = mPluginManager.getLoadedPlugin(component);
-
+        
+        if (plugin == null) {
+            Log.w(TAG, "Error target: " + target.toURI());
+            return START_STICKY;
+        }
+        // ClassNotFoundException when unmarshalling in Android 5.1
+        target.setExtrasClassLoader(plugin.getClassLoader());
         switch (command) {
             case EXTRA_COMMAND_START_SERVICE: {
-                ActivityThread mainThread = (ActivityThread)ReflectUtil.getActivityThread(getBaseContext());
+                ActivityThread mainThread = ActivityThread.currentActivityThread();
                 IApplicationThread appThread = mainThread.getApplicationThread();
                 Service service;
 
@@ -112,7 +120,7 @@ public class LocalService extends Service {
                 break;
             }
             case EXTRA_COMMAND_BIND_SERVICE: {
-                ActivityThread mainThread = (ActivityThread)ReflectUtil.getActivityThread(getBaseContext());
+                ActivityThread mainThread = ActivityThread.currentActivityThread();
                 IApplicationThread appThread = mainThread.getApplicationThread();
                 Service service = null;
 
@@ -131,16 +139,20 @@ public class LocalService extends Service {
                         service.onCreate();
                         this.mPluginManager.getComponentsHandler().rememberService(component, service);
                     } catch (Throwable t) {
-                        t.printStackTrace();
+                        Log.w(TAG, t);
                     }
                 }
                 try {
                     IBinder binder = service.onBind(target);
                     IBinder serviceConnection = PluginUtil.getBinder(intent.getExtras(), "sc");
                     IServiceConnection iServiceConnection = IServiceConnection.Stub.asInterface(serviceConnection);
-                    iServiceConnection.connected(component, binder);
+                    if (Build.VERSION.SDK_INT >= 26) {
+                        iServiceConnection.connected(component, binder, false);
+                    } else {
+                        Reflector.QuietReflector.with(iServiceConnection).method("connected", ComponentName.class, IBinder.class).call(component, binder);
+                    }
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    Log.w(TAG, e);
                 }
                 break;
             }

@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class ComponentsHandler {
 
-    public static final String TAG = "PluginManager";
+    public static final String TAG = Constants.TAG_PREFIX + "PluginManager";
 
     private Context mContext;
     private PluginManager mPluginManager;
@@ -58,7 +58,8 @@ public class ComponentsHandler {
      */
     public Intent transformIntentToExplicitAsNeeded(Intent intent) {
         ComponentName component = intent.getComponent();
-        if (component == null) {
+        if (component == null
+            || component.getPackageName().equals(mContext.getPackageName())) {
             ResolveInfo info = mPluginManager.resolveActivity(intent);
             if (info != null && info.activityInfo != null) {
                 component = new ComponentName(info.activityInfo.packageName, info.activityInfo.name);
